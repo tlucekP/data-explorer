@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/app.log
+app.log
+.playwright-cli/
+ELEMENTS_GLOSSARY.md
