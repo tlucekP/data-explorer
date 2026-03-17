@@ -36,6 +36,56 @@ def _matches_modified(
     return True
 
 
+def _iter_candidate_files(root: Path, recursive: bool) -> list[Path]:
+    iterator = root.rglob("*") if recursive else root.glob("*")
+    return [path for path in iterator if path.is_file()]
+
+
+def _is_supported_type(path: Path, requested_types: set[str]) -> bool:
+    ext = path.suffix.lower()
+    return ext in SUPPORTED_EXTENSIONS and ext in requested_types
+
+
+def _matches_search(path: Path, normalized_search: str) -> bool:
+    if not normalized_search:
+        return True
+    return normalized_search in path.name.lower()
+
+
+def _build_file_entry(path: Path, modified_at: datetime, size_bytes: int) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "name": path.name,
+        "extension": path.suffix.lower(),
+        "size_bytes": size_bytes,
+        "modified_at": modified_at,
+    }
+
+
+def _collect_filtered_entries(
+    candidates: list[Path],
+    requested_types: set[str],
+    normalized_search: str,
+    size_range: tuple[int | None, int | None] | None,
+    modified_range: tuple[datetime | None, datetime | None] | None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for path in candidates:
+        if not _is_supported_type(path, requested_types):
+            continue
+        if not _matches_search(path, normalized_search):
+            continue
+
+        stat = path.stat()
+        modified_at = datetime.fromtimestamp(stat.st_mtime)
+        if not _matches_size(stat.st_size, size_range):
+            continue
+        if not _matches_modified(modified_at, modified_range):
+            continue
+        entries.append(_build_file_entry(path, modified_at, stat.st_size))
+    return entries
+
+
 def list_supported_files(
     root_path: str,
     recursive: bool = True,
@@ -54,34 +104,14 @@ def list_supported_files(
 
     requested_types = {ext.lower() for ext in (file_types or list(SUPPORTED_EXTENSIONS))}
     normalized_search = (search or "").strip().lower()
-    iterator = root.rglob("*") if recursive else root.glob("*")
-
-    result: list[dict[str, Any]] = []
-    for path in iterator:
-        if not path.is_file():
-            continue
-        ext = path.suffix.lower()
-        if ext not in SUPPORTED_EXTENSIONS or ext not in requested_types:
-            continue
-
-        stat = path.stat()
-        modified_at = datetime.fromtimestamp(stat.st_mtime)
-        if normalized_search and normalized_search not in path.name.lower():
-            continue
-        if not _matches_size(stat.st_size, size_range):
-            continue
-        if not _matches_modified(modified_at, modified_range):
-            continue
-
-        result.append(
-            {
-                "path": str(path),
-                "name": path.name,
-                "extension": ext,
-                "size_bytes": stat.st_size,
-                "modified_at": modified_at,
-            }
-        )
+    candidates = _iter_candidate_files(root, recursive)
+    result = _collect_filtered_entries(
+        candidates,
+        requested_types,
+        normalized_search,
+        size_range,
+        modified_range,
+    )
 
     result.sort(key=lambda item: item["modified_at"], reverse=True)
     return result

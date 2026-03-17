@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 import logging
-import time as pytime
 from typing import Any
 
 import streamlit as st
 
-from privacy.pii_detector import PiiReport, PrivacyMode, parse_mode
+from privacy.pii_detector import PiiReport, PrivacyMode, parse_mode, report_from_matches
 
 logger = logging.getLogger(__name__)
 
@@ -51,27 +50,6 @@ def reset_pii_reveal(reason: str, log: bool = True) -> None:
         logger.info("pii_reveal_hidden reason=%s", reason)
 
 
-def report_from_matches(matches: list[Any]) -> PiiReport:
-    if not matches:
-        return PiiReport(has_pii=False, matches=[])
-
-    totals: dict[str, int] = {}
-    columns: dict[str, set[str]] = {}
-    rows: dict[str, set[int]] = {}
-    for match in matches:
-        totals[match.pii_type] = totals.get(match.pii_type, 0) + 1
-        columns.setdefault(match.pii_type, set()).add(match.column)
-        rows.setdefault(match.pii_type, set()).add(match.row_idx)
-
-    return PiiReport(
-        has_pii=True,
-        totals_by_type=totals,
-        columns_by_type={key: sorted(list(value)) for key, value in columns.items()},
-        row_indexes_by_type={key: sorted(list(value)) for key, value in rows.items()},
-        matches=matches,
-    )
-
-
 def effective_pii_report(pii_report: PiiReport, selected_file: str, mode: str) -> PiiReport:
     if parse_mode(mode) != PrivacyMode.STRICT:
         return pii_report
@@ -83,7 +61,7 @@ def effective_pii_report(pii_report: PiiReport, selected_file: str, mode: str) -
         match for match in pii_report.matches
         if build_pii_reveal_key(selected_file, mode, match) not in keys
     ]
-    return report_from_matches(filtered)
+    return report_from_matches(filtered)  # type: ignore[arg-type]
 
 
 def clear_file_dependent_state() -> None:

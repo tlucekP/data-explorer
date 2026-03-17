@@ -13,7 +13,7 @@ import streamlit as st
 from core.profiler import profile_csv, profile_text
 from privacy.anonymizer import AnonymizationResult, anonymize_csv, anonymize_text
 from privacy.pii_detector import PiiReport, detect_csv_pii, detect_text_pii
-from utils.cache import anonymized_cache_key, pii_cache_key
+from utils.cache import pii_cache_key
 from utils.pii_state import effective_pii_report
 
 logger = logging.getLogger(__name__)

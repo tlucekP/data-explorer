@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
 
 import pandas as pd
 
@@ -100,4 +99,3 @@ def anonymize_text(text: str, pii_report: PiiReport) -> AnonymizationResult:
         token_maps=token_maps,
         replaced_counts=replaced_counts,
     )
-

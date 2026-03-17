@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 
 from core.file_ops import pick_folder_with_windows_dialog
 from privacy.pii_detector import PrivacyMode, parse_mode
-from ui.i18n import LANG_OPTIONS, t
 from ui.file_panel import render_file_panel
+from ui.i18n import LANG_OPTIONS, t
 from ui.shutdown import handle_shutdown_button
 from ui.styles import render_backend_chip, render_styles
 from ui.tabs.tab_ai import render_tab_ai
@@ -36,10 +36,7 @@ logger.propagate = True
 st.set_page_config(page_title="Data Explorer", page_icon="🔐", layout="wide")
 
 
-def main() -> None:
-    ensure_session_defaults(st.session_state)
-
-    # --- Language picker ---
+def _render_language_picker() -> None:
     lang_labels = list(LANG_OPTIONS.keys())
     current_label = next(
         (label for label, code in LANG_OPTIONS.items() if code == st.session_state.get("ui_lang", "cs")),
@@ -83,7 +80,8 @@ def main() -> None:
         )
     st.session_state["ui_lang"] = LANG_OPTIONS[selected_lang_label]
 
-    # --- Sidebar: root folder ---
+
+def _handle_root_path_controls() -> str:
     st.sidebar.header(t("sidebar_settings"))
     if "pending_root_path_input" in st.session_state:
         st.session_state["root_path_input"] = st.session_state.pop("pending_root_path_input")
@@ -109,8 +107,10 @@ def main() -> None:
         clear_file_dependent_state()
         st.session_state["last_scan_signature"] = None
         st.session_state["last_root_path_value"] = root_path
+    return root_path
 
-    # --- Sidebar: privacy mode ---
+
+def _select_privacy_mode() -> PrivacyMode:
     mode_options = [PrivacyMode.STRICT.value, PrivacyMode.BALANCED.value, PrivacyMode.RELAXED.value]
     privacy_mode = st.sidebar.selectbox(t("privacy_mode"), options=mode_options, index=0)
     parsed_mode = parse_mode(privacy_mode)
@@ -125,8 +125,10 @@ def main() -> None:
         st.sidebar.info(t("balanced_info"))
     else:
         st.sidebar.warning(t("relaxed_warning"))
+    return parsed_mode
 
-    # --- Sidebar: backend animation style ---
+
+def _select_backend_animation_style() -> str:
     anim_style_options = {
         t("backend_anim_pulse"): "pulse",
         t("backend_anim_orbit"): "orbit",
@@ -138,16 +140,10 @@ def main() -> None:
         index=0,
         help=t("backend_anim_help"),
     )
-    backend_anim_style = anim_style_options[selected_anim_label]
+    return anim_style_options[selected_anim_label]
 
-    search = st.sidebar.text_input(t("search_name"))
 
-    # --- Global UI elements ---
-    render_styles()
-    render_backend_chip(backend_anim_style)
-    handle_shutdown_button()
-
-    # --- Main layout ---
+def _render_workspace(root_path: str, search: str, parsed_mode: PrivacyMode) -> None:
     with st.container(key="workspace_layout"):
         file_panel_col, content_col = st.columns([1, 3], gap="small")
         with file_panel_col:
@@ -164,6 +160,20 @@ def main() -> None:
                 render_tab_ai(selected_file, parsed_mode)
             with tab_logs:
                 render_tab_logs()
+
+
+def main() -> None:
+    ensure_session_defaults(st.session_state)
+    _render_language_picker()
+    root_path = _handle_root_path_controls()
+    parsed_mode = _select_privacy_mode()
+    backend_anim_style = _select_backend_animation_style()
+    search = st.sidebar.text_input(t("search_name"))
+
+    render_styles()
+    render_backend_chip(backend_anim_style)
+    handle_shutdown_button()
+    _render_workspace(root_path, search, parsed_mode)
 
 
 if __name__ == "__main__":

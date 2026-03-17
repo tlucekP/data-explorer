@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import time as pytime
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -17,12 +16,99 @@ from ui.i18n import t
 from utils.pii_state import (
     build_pii_reveal_key,
     reset_pii_reveal,
-    reset_pii_safe_overrides,
     safe_match_keys,
     save_safe_match_keys,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _expire_reveal_if_needed() -> str | None:
+    reveal_key = st.session_state.get("pii_reveal_key")
+    reveal_until = st.session_state.get("pii_reveal_until_ts")
+    if reveal_key and (reveal_until is None or pytime.time() > float(reveal_until)):
+        reset_pii_reveal("timeout")
+        return None
+    return reveal_key
+
+
+def _render_match_headers() -> None:
+    header_cols = st.columns([1, 1, 1, 1.35, 1.35, 0.75, 0.9])
+    header_cols[0].markdown(f"**{t('type')}**")
+    header_cols[1].markdown(f"**{t('row')}**")
+    header_cols[2].markdown(f"**{t('column')}**")
+    header_cols[3].markdown(f"**{t('masked_match')}**")
+    header_cols[4].markdown(f"**{t('detection_rule')}**")
+    header_cols[5].markdown("**confidence**")
+    header_cols[6].markdown(f"**{t('action')}**")
+
+
+def _render_match_row(
+    idx: int,
+    match: Any,
+    selected_file: str,
+    mode: str,
+) -> tuple[str, Any]:
+    key = build_pii_reveal_key(selected_file, mode, match)
+    cols = st.columns([1, 1, 1, 1.35, 1.35, 0.75, 0.9])
+    cols[0].write(match.pii_type)
+    cols[1].write(match.row_idx)
+    cols[2].write(match.column)
+    cols[3].write(match.masked_preview)
+    cols[4].write(match.source_rule)
+    cols[5].write(round(match.confidence, 2))
+
+    label = t("shown") if st.session_state.get("pii_reveal_key") == key else t("show")
+    if cols[6].button(label, key=f"pii_reveal_btn_{idx}", use_container_width=True):
+        st.session_state["pii_reveal_key"] = key
+        st.session_state["pii_reveal_until_ts"] = pytime.time() + 30
+        logger.info(
+            "pii_reveal_clicked type=%s row=%s column=%s",
+            match.pii_type,
+            match.row_idx,
+            match.column,
+        )
+        st.rerun()
+    return key, match
+
+
+def _mark_safe_action(selected_file: str, mode: str, active_match: Any) -> None:
+    keys = safe_match_keys()
+    match_key = build_pii_reveal_key(selected_file, mode, active_match)
+    keys.add(match_key)
+    save_safe_match_keys(keys)
+    logger.info(
+        "pii_safe_marked file=%s mode=%s type=%s row=%s column=%s rule=%s",
+        selected_file,
+        mode,
+        active_match.pii_type,
+        active_match.row_idx,
+        active_match.column,
+        active_match.source_rule,
+    )
+    reset_pii_reveal("safe_marked")
+    st.rerun()
+
+
+def _render_active_finding(active_match: Any, selected_file: str, mode: str, active_until: float) -> None:
+    remaining = max(0, int(float(active_until) - pytime.time()))
+    st.markdown(f"#### {t('finding_detail')}")
+    st.warning(t("sensitive_warning"))
+    st.write(t("masked_value", value=active_match.masked_preview))
+    raw_value = active_match.raw_value if getattr(active_match, "raw_value", "") else t("value_unavailable")
+    st.write(t("unmasked_value", value=raw_value))
+    st.caption(t("auto_hide", seconds=remaining))
+    action_cols = st.columns([1, 1.6, 3])
+    if action_cols[0].button(t("hide"), key="pii_reveal_hide", type="secondary"):
+        reset_pii_reveal("manual")
+        st.rerun()
+    if parse_mode(mode) == PrivacyMode.STRICT and action_cols[1].button(
+        t("mark_safe"),
+        key="pii_mark_safe",
+        type="primary",
+        use_container_width=True,
+    ):
+        _mark_safe_action(selected_file, mode, active_match)
 
 
 def render_profile(profile: dict[str, Any], file_path: str) -> None:
@@ -81,45 +167,13 @@ def render_pii_report(pii_report: PiiReport, selected_file: str, mode: str) -> N
     matches = pii_report.matches[:200]
     st.subheader(t("masked_samples"))
 
-    reveal_key = st.session_state.get("pii_reveal_key")
-    reveal_until = st.session_state.get("pii_reveal_until_ts")
-    if reveal_key and (reveal_until is None or pytime.time() > float(reveal_until)):
-        reset_pii_reveal("timeout")
-        reveal_key = None
-
-    header_cols = st.columns([1, 1, 1, 1.35, 1.35, 0.75, 0.9])
-    header_cols[0].markdown(f"**{t('type')}**")
-    header_cols[1].markdown(f"**{t('row')}**")
-    header_cols[2].markdown(f"**{t('column')}**")
-    header_cols[3].markdown(f"**{t('masked_match')}**")
-    header_cols[4].markdown(f"**{t('detection_rule')}**")
-    header_cols[5].markdown("**confidence**")
-    header_cols[6].markdown(f"**{t('action')}**")
+    _expire_reveal_if_needed()
+    _render_match_headers()
 
     reveal_map: dict[str, Any] = {}
     for idx, match in enumerate(matches):
-        key = build_pii_reveal_key(selected_file, mode, match)
-        reveal_map[key] = match
-
-        cols = st.columns([1, 1, 1, 1.35, 1.35, 0.75, 0.9])
-        cols[0].write(match.pii_type)
-        cols[1].write(match.row_idx)
-        cols[2].write(match.column)
-        cols[3].write(match.masked_preview)
-        cols[4].write(match.source_rule)
-        cols[5].write(round(match.confidence, 2))
-
-        label = t("shown") if st.session_state.get("pii_reveal_key") == key else t("show")
-        if cols[6].button(label, key=f"pii_reveal_btn_{idx}", use_container_width=True):
-            st.session_state["pii_reveal_key"] = key
-            st.session_state["pii_reveal_until_ts"] = pytime.time() + 30
-            logger.info(
-                "pii_reveal_clicked type=%s row=%s column=%s",
-                match.pii_type,
-                match.row_idx,
-                match.column,
-            )
-            st.rerun()
+        key, resolved_match = _render_match_row(idx, match, selected_file, mode)
+        reveal_map[key] = resolved_match
 
     active_key = st.session_state.get("pii_reveal_key")
     active_until = st.session_state.get("pii_reveal_until_ts")
@@ -128,39 +182,7 @@ def render_pii_report(pii_report: PiiReport, selected_file: str, mode: str) -> N
         active_key = None
 
     if active_key and active_key in reveal_map and active_until is not None:
-        active_match = reveal_map[active_key]
-        remaining = max(0, int(float(active_until) - pytime.time()))
-        st.markdown(f"#### {t('finding_detail')}")
-        st.warning(t("sensitive_warning"))
-        st.write(t("masked_value", value=active_match.masked_preview))
-        raw_value = active_match.raw_value if getattr(active_match, "raw_value", "") else t("value_unavailable")
-        st.write(t("unmasked_value", value=raw_value))
-        st.caption(t("auto_hide", seconds=remaining))
-        action_cols = st.columns([1, 1.6, 3])
-        if action_cols[0].button(t("hide"), key="pii_reveal_hide", type="secondary"):
-            reset_pii_reveal("manual")
-            st.rerun()
-        if parse_mode(mode) == PrivacyMode.STRICT and action_cols[1].button(
-            t("mark_safe"),
-            key="pii_mark_safe",
-            type="primary",
-            use_container_width=True,
-        ):
-            keys = safe_match_keys()
-            match_key = build_pii_reveal_key(selected_file, mode, active_match)
-            keys.add(match_key)
-            save_safe_match_keys(keys)
-            logger.info(
-                "pii_safe_marked file=%s mode=%s type=%s row=%s column=%s rule=%s",
-                selected_file,
-                mode,
-                active_match.pii_type,
-                active_match.row_idx,
-                active_match.column,
-                active_match.source_rule,
-            )
-            reset_pii_reveal("safe_marked")
-            st.rerun()
+        _render_active_finding(reveal_map[active_key], selected_file, mode, float(active_until))
 
 
 def display_chat_history(history: list[dict[str, str]]) -> None:

@@ -7,7 +7,6 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
 
 import pandas as pd
 
@@ -183,7 +182,7 @@ def _new_match(
     )
 
 
-def _report_from_matches(matches: list[PiiMatch]) -> PiiReport:
+def report_from_matches(matches: list[PiiMatch]) -> PiiReport:
     if not matches:
         return PiiReport(has_pii=False, matches=[])
 
@@ -202,6 +201,155 @@ def _report_from_matches(matches: list[PiiMatch]) -> PiiReport:
         row_indexes_by_type={key: sorted(list(value)) for key, value in rows.items()},
         matches=matches,
     )
+
+
+@dataclass(frozen=True)
+class _ColumnFlags:
+    is_name_col: bool
+    is_address_col: bool
+    is_rc_col: bool
+    is_dob_hint_col: bool
+    is_timestamp_col: bool
+
+
+def _classify_column(column_name: str) -> _ColumnFlags:
+    normalized_col = _normalize_name(column_name)
+    return _ColumnFlags(
+        is_name_col=normalized_col in NAME_KEYS,
+        is_address_col=normalized_col in ADDRESS_KEYS,
+        is_rc_col=normalized_col in RC_KEYS,
+        is_dob_hint_col=_is_dob_hint_column(normalized_col),
+        is_timestamp_col=normalized_col in TIMESTAMP_WHITELIST_KEYS,
+    )
+
+
+def _name_confidence(parsed_mode: PrivacyMode) -> float:
+    if parsed_mode == PrivacyMode.STRICT:
+        return 0.72
+    if parsed_mode == PrivacyMode.BALANCED:
+        return 0.62
+    return 0.55
+
+
+def _address_confidence(parsed_mode: PrivacyMode) -> float:
+    if parsed_mode == PrivacyMode.STRICT:
+        return 0.72
+    if parsed_mode == PrivacyMode.BALANCED:
+        return 0.62
+    return 0.55
+
+
+def _match_date(raw: str) -> date | None:
+    for pattern in DATE_PATTERNS:
+        if pattern.search(raw):
+            parsed = _parse_date(raw)
+            if parsed:
+                return parsed
+    return None
+
+
+def _detect_regex_matches(
+    raw: str,
+    row_idx: int,
+    col: str,
+    parsed_mode: PrivacyMode,
+    column_flags: _ColumnFlags,
+) -> dict[str, PiiMatch]:
+    detections: dict[str, PiiMatch] = {}
+    if EMAIL_PATTERN.search(raw):
+        detections["EMAIL"] = _new_match("EMAIL", row_idx, col, raw, 0.99, "regex_email")
+
+    phone_match = PHONE_PATTERN.search(raw)
+    if phone_match and _valid_phone(raw):
+        detections["PHONE"] = _new_match("PHONE", row_idx, col, raw, 0.9, "regex_phone")
+
+    parsed_date = _match_date(raw)
+    if parsed_date and not column_flags.is_timestamp_col:
+        if column_flags.is_dob_hint_col or parsed_date.year < date.today().year - 10:
+            detections["DOB"] = _new_match("DOB", row_idx, col, raw, 0.88, "regex_date")
+
+    if RC_PATTERN.search(raw) and (parsed_mode == PrivacyMode.RELAXED or _valid_rc(raw)):
+        detections["RC"] = _new_match("RC", row_idx, col, raw, 0.9, "regex_rc")
+
+    if BANK_ACCOUNT_PATTERN.search(raw) or IBAN_PATTERN.search(raw) or CZ_IBAN_PATTERN.search(raw):
+        detections["BANK"] = _new_match("BANK", row_idx, col, raw, 0.9, "regex_bank")
+    return detections
+
+
+def _apply_column_heuristics(
+    detections: dict[str, PiiMatch],
+    raw: str,
+    row_idx: int,
+    col: str,
+    parsed_mode: PrivacyMode,
+    column_flags: _ColumnFlags,
+) -> None:
+    if column_flags.is_rc_col and "RC" not in detections:
+        detections["RC"] = _new_match("RC", row_idx, col, raw, 0.7, "column_rc_heuristic")
+    if column_flags.is_name_col:
+        detections["NAME"] = _new_match(
+            "NAME",
+            row_idx,
+            col,
+            raw,
+            _name_confidence(parsed_mode),
+            "column_name_heuristic",
+        )
+    if column_flags.is_address_col:
+        detections["ADDRESS"] = _new_match(
+            "ADDRESS",
+            row_idx,
+            col,
+            raw,
+            _address_confidence(parsed_mode),
+            "column_address_heuristic",
+        )
+
+
+def _apply_address_heuristics(
+    detections: dict[str, PiiMatch],
+    raw: str,
+    row_idx: int,
+    col: str,
+    parsed_mode: PrivacyMode,
+) -> None:
+    if parsed_mode not in (PrivacyMode.STRICT, PrivacyMode.BALANCED):
+        return
+    lowered = raw.lower()
+    if POSTCODE_PATTERN.search(raw):
+        detections.setdefault(
+            "ADDRESS",
+            _new_match("ADDRESS", row_idx, col, raw, 0.6, "postcode_heuristic"),
+        )
+    if parsed_mode == PrivacyMode.STRICT and any(hint in lowered for hint in ADDRESS_HINTS):
+        detections.setdefault(
+            "ADDRESS",
+            _new_match("ADDRESS", row_idx, col, raw, 0.65, "address_hint_heuristic"),
+        )
+
+
+def _collect_cell_matches(
+    raw: str,
+    row_idx: int,
+    col: str,
+    parsed_mode: PrivacyMode,
+    column_flags: _ColumnFlags,
+) -> list[PiiMatch]:
+    detections = _detect_regex_matches(raw, row_idx, col, parsed_mode, column_flags)
+    _apply_column_heuristics(detections, raw, row_idx, col, parsed_mode, column_flags)
+    _apply_address_heuristics(detections, raw, row_idx, col, parsed_mode)
+    return list(detections.values())
+
+
+def _iter_column_values(df: pd.DataFrame, column: str) -> list[tuple[int, str]]:
+    values: list[tuple[int, str]] = []
+    for row_idx, value in enumerate(df[column].tolist()):
+        if pd.isna(value):
+            continue
+        raw = str(value).strip()
+        if raw:
+            values.append((row_idx, raw))
+    return values
 
 
 def _collect_line_matches(line: str, line_idx: int, mode: PrivacyMode) -> list[PiiMatch]:
@@ -240,7 +388,7 @@ def detect_text_pii(text: str, mode: str | PrivacyMode) -> PiiReport:
     matches: list[PiiMatch] = []
     for idx, line in enumerate(text.splitlines(), start=1):
         matches.extend(_collect_line_matches(line, idx, parsed_mode))
-    return _report_from_matches(matches)
+    return report_from_matches(matches)
 
 
 def detect_csv_pii(df: pd.DataFrame, mode: str | PrivacyMode) -> PiiReport:
@@ -250,87 +398,8 @@ def detect_csv_pii(df: pd.DataFrame, mode: str | PrivacyMode) -> PiiReport:
 
     for column in df.columns:
         col = str(column)
-        normalized_col = _normalize_name(col)
-        is_name_col = normalized_col in NAME_KEYS
-        is_address_col = normalized_col in ADDRESS_KEYS
-        is_rc_col = normalized_col in RC_KEYS
-        is_dob_hint_col = _is_dob_hint_column(normalized_col)
-        is_timestamp_col = normalized_col in TIMESTAMP_WHITELIST_KEYS
+        column_flags = _classify_column(col)
+        for row_idx, raw in _iter_column_values(df, col):
+            matches.extend(_collect_cell_matches(raw, row_idx, col, parsed_mode, column_flags))
 
-        for row_idx, value in enumerate(df[col].tolist()):
-            if pd.isna(value):
-                continue
-            raw = str(value).strip()
-            if not raw:
-                continue
-
-            cell_detections: dict[str, PiiMatch] = {}
-
-            if EMAIL_PATTERN.search(raw):
-                cell_detections["EMAIL"] = _new_match("EMAIL", row_idx, col, raw, 0.99, "regex_email")
-
-            phone_match = PHONE_PATTERN.search(raw)
-            if phone_match and _valid_phone(raw):
-                cell_detections["PHONE"] = _new_match("PHONE", row_idx, col, raw, 0.9, "regex_phone")
-
-            parsed_date: date | None = None
-            for pattern in DATE_PATTERNS:
-                if pattern.search(raw):
-                    parsed_date = _parse_date(raw)
-                    if parsed_date:
-                        break
-            if parsed_date and not is_timestamp_col:
-                if is_dob_hint_col or parsed_date.year < date.today().year - 10:
-                    cell_detections["DOB"] = _new_match("DOB", row_idx, col, raw, 0.88, "regex_date")
-
-            if RC_PATTERN.search(raw):
-                if parsed_mode == PrivacyMode.RELAXED or _valid_rc(raw):
-                    cell_detections["RC"] = _new_match("RC", row_idx, col, raw, 0.9, "regex_rc")
-
-            if BANK_ACCOUNT_PATTERN.search(raw) or IBAN_PATTERN.search(raw) or CZ_IBAN_PATTERN.search(raw):
-                cell_detections["BANK"] = _new_match("BANK", row_idx, col, raw, 0.9, "regex_bank")
-
-            if is_rc_col and "RC" not in cell_detections:
-                cell_detections["RC"] = _new_match("RC", row_idx, col, raw, 0.7, "column_rc_heuristic")
-
-            if is_name_col:
-                if parsed_mode == PrivacyMode.STRICT:
-                    confidence = 0.72
-                elif parsed_mode == PrivacyMode.BALANCED:
-                    confidence = 0.62
-                else:
-                    confidence = 0.55
-                cell_detections["NAME"] = _new_match("NAME", row_idx, col, raw, confidence, "column_name_heuristic")
-
-            if is_address_col:
-                if parsed_mode == PrivacyMode.STRICT:
-                    confidence = 0.72
-                elif parsed_mode == PrivacyMode.BALANCED:
-                    confidence = 0.62
-                else:
-                    confidence = 0.55
-                cell_detections["ADDRESS"] = _new_match(
-                    "ADDRESS",
-                    row_idx,
-                    col,
-                    raw,
-                    confidence,
-                    "column_address_heuristic",
-                )
-
-            if parsed_mode in (PrivacyMode.STRICT, PrivacyMode.BALANCED):
-                lowered = raw.lower()
-                if POSTCODE_PATTERN.search(raw):
-                    cell_detections.setdefault(
-                        "ADDRESS",
-                        _new_match("ADDRESS", row_idx, col, raw, 0.6, "postcode_heuristic"),
-                    )
-                if parsed_mode == PrivacyMode.STRICT and any(hint in lowered for hint in ADDRESS_HINTS):
-                    cell_detections.setdefault(
-                        "ADDRESS",
-                        _new_match("ADDRESS", row_idx, col, raw, 0.65, "address_hint_heuristic"),
-                    )
-
-            matches.extend(cell_detections.values())
-
-    return _report_from_matches(matches)
+    return report_from_matches(matches)

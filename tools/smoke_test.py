@@ -16,6 +16,7 @@ from llm.mistral_client import _serialize_with_size_guard
 from privacy.anonymizer import anonymize_csv
 from privacy.pii_detector import PrivacyMode, detect_csv_pii
 
+
 def make_big_df(rows: int = 2000) -> pd.DataFrame:
     # big text to trigger payload truncation
     long_text = "X" * 500
@@ -31,39 +32,9 @@ def assert_true(cond: bool, msg: str) -> None:
     if not cond:
         raise AssertionError(msg)
 
-def main() -> int:
-    print("== Smoke test pipeline ==")
 
-    # load
-    df = make_big_df(2000)
-
-    # profile
-    profile = profile_csv(df)
-    assert_true(profile.get("row_count", 0) == len(df), "Profile row_count mismatch.")
-
-    # pii detection
-    pii_report = detect_csv_pii(df, mode=PrivacyMode.STRICT)
-    assert_true(pii_report.has_pii, "Expected PII to be detected.")
-
-    # anonymize
-    anonymized_result = anonymize_csv(df, pii_report)
-    anon_df = anonymized_result.anonymized_df
-    replaced_counts = anonymized_result.replaced_counts
-    assert_true(anon_df is not None, "Expected anonymized dataframe.")
-    assert_true(replaced_counts.get("EMAIL", 0) > 0 or replaced_counts.get("BANK", 0) > 0,
-                "Expected anonymizer to replace some PII.")
-
-    # context build
-    context_payload = build_context(
-        file_kind="csv",
-        profile=profile_csv(anon_df),
-        source_payload=anon_df,
-        mode=PrivacyMode.STRICT,
-        scope=ContextScope.SCHEMA_STATS_SAMPLE,
-    )
-
-    # payload serialize + size guard (must not crash)
-    user_payload = {
+def _build_user_payload(context_payload: dict[str, object]) -> dict[str, object]:
+    return {
         "task": "Smoke test",
         "dataset": {
             "schema": context_payload["profile"]["schema"],
@@ -73,7 +44,34 @@ def main() -> int:
         "analysis_scope": ["Respond in Czech. Only use provided context."],
     }
 
-    serialized = _serialize_with_size_guard(user_payload)
+
+def _run_pipeline() -> str:
+    df = make_big_df(2000)
+    profile = profile_csv(df)
+    assert_true(profile.get("row_count", 0) == len(df), "Profile row_count mismatch.")
+    pii_report = detect_csv_pii(df, mode=PrivacyMode.STRICT)
+    assert_true(pii_report.has_pii, "Expected PII to be detected.")
+    anonymized_result = anonymize_csv(df, pii_report)
+    anon_df = anonymized_result.anonymized_df
+    replaced_counts = anonymized_result.replaced_counts
+    assert_true(anon_df is not None, "Expected anonymized dataframe.")
+    assert_true(
+        replaced_counts.get("EMAIL", 0) > 0 or replaced_counts.get("BANK", 0) > 0,
+        "Expected anonymizer to replace some PII.",
+    )
+
+    context_payload = build_context(
+        file_kind="csv",
+        profile=profile_csv(anon_df),
+        source_payload=anon_df,
+        mode=PrivacyMode.STRICT,
+        scope=ContextScope.SCHEMA_STATS_SAMPLE,
+    )
+    user_payload = _build_user_payload(context_payload)
+    return _serialize_with_size_guard(user_payload)
+
+
+def _assert_payload(serialized: str) -> None:
     size = len(serialized.encode("utf-8"))
     assert_true(size > 0, "Serialized payload should not be empty.")
 
@@ -82,8 +80,14 @@ def main() -> int:
     assert_true(isinstance(ds, dict), "dataset must be a dict in payload.")
     assert_true("sample" not in ds or isinstance(ds.get("sample"), list), "dataset.sample must be list if present.")
 
+
+def main() -> int:
+    print("== Smoke test pipeline ==")
+    serialized = _run_pipeline()
+    _assert_payload(serialized)
     print("PASS: smoke pipeline OK")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

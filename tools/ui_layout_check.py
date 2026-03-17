@@ -166,19 +166,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = _build_parser().parse_args()
-
+def _resolve_npx() -> str | None:
     npx = shutil.which("npx")
-    if not npx:
-        print("ERROR: npx is required for ui_layout_check but was not found in PATH.")
-        return 2
+    return npx
 
-    repo_root = Path(__file__).resolve().parents[1]
-    port = _free_tcp_port()
-    url = f"http://127.0.0.1:{port}"
-    session_id = f"layout-check-{int(time.time())}"
 
+def _start_streamlit_app(repo_root: Path, port: int) -> subprocess.Popen[str]:
     app_cmd = [
         sys.executable,
         "-m",
@@ -194,8 +187,7 @@ def main() -> int:
         "--browser.gatherUsageStats",
         "false",
     ]
-
-    app_proc = subprocess.Popen(  # noqa: S603 - trusted local command
+    return subprocess.Popen(  # noqa: S603 - trusted local command
         app_cmd,
         cwd=repo_root,
         stdout=subprocess.PIPE,
@@ -203,28 +195,63 @@ def main() -> int:
         text=True,
     )
 
+
+def _run_layout_check(
+    npx: str,
+    session_id: str,
+    url: str,
+    app_proc: subprocess.Popen[str],
+    *,
+    width: int,
+    height: int,
+    tolerance_px: float,
+) -> int:
+    _wait_for_http(url, timeout_sec=STREAMLIT_STARTUP_TIMEOUT_SEC, app_proc=app_proc)
+    _run_cmd([npx, "--yes", "@playwright/cli", f"-s={session_id}", "open", url], timeout_sec=90.0)
+    metrics = _wait_for_metrics(
+        npx,
+        session_id,
+        timeout_sec=PAGE_READY_TIMEOUT_SEC,
+        width=width,
+        height=height,
+    )
+    issues = _validate_layout(metrics, tolerance_px=tolerance_px)
+    if issues:
+        print("UI_LAYOUT_CHECK: FAIL")
+        for issue in issues:
+            print(f"- {issue}")
+        print("Measured metrics:")
+        print(json.dumps(metrics, indent=2))
+        return 1
+
+    print("UI_LAYOUT_CHECK: PASS")
+    print(json.dumps(metrics, indent=2))
+    return 0
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
+    npx = _resolve_npx()
+    if not npx:
+        print("ERROR: npx is required for ui_layout_check but was not found in PATH.")
+        return 2
+
+    repo_root = Path(__file__).resolve().parents[1]
+    port = _free_tcp_port()
+    url = f"http://127.0.0.1:{port}"
+    session_id = f"layout-check-{int(time.time())}"
+    app_proc = _start_streamlit_app(repo_root, port)
+
     try:
-        _wait_for_http(url, timeout_sec=STREAMLIT_STARTUP_TIMEOUT_SEC, app_proc=app_proc)
-        _run_cmd([npx, "--yes", "@playwright/cli", f"-s={session_id}", "open", url], timeout_sec=90.0)
-        metrics = _wait_for_metrics(
+        return _run_layout_check(
             npx,
             session_id,
-            timeout_sec=PAGE_READY_TIMEOUT_SEC,
+            url,
+            app_proc,
             width=args.width,
             height=args.height,
+            tolerance_px=args.tolerance_px,
         )
-        issues = _validate_layout(metrics, tolerance_px=args.tolerance_px)
-        if issues:
-            print("UI_LAYOUT_CHECK: FAIL")
-            for issue in issues:
-                print(f"- {issue}")
-            print("Measured metrics:")
-            print(json.dumps(metrics, indent=2))
-            return 1
-
-        print("UI_LAYOUT_CHECK: PASS")
-        print(json.dumps(metrics, indent=2))
-        return 0
     finally:
         try:
             _run_cmd(

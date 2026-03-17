@@ -60,6 +60,98 @@ def _history_newest_first_with_user_first(history: list[dict[str, str]]) -> list
     return ordered
 
 
+def _select_context_scope() -> str:
+    scope_map = {
+        t("ctx_schema_only"): ContextScope.SCHEMA.value,
+        t("ctx_schema_stats"): ContextScope.SCHEMA_STATS.value,
+        t("ctx_schema_stats_sample"): ContextScope.SCHEMA_STATS_SAMPLE.value,
+    }
+    scope_label = st.selectbox(t("ai_context"), options=list(scope_map.keys()), index=1)
+    scope_value = scope_map[scope_label]
+    st.caption(t("ai_context_badge", scope=scope_value))
+    return scope_value
+
+
+def _select_ai_source(
+    selected_file: str,
+    payload: object,
+    pii_report: object,
+    effective_report: object,
+    parsed_mode: PrivacyMode,
+    anonymized_key: str,
+    anonymized_result: object | None,
+) -> tuple[str, object | None]:
+    if effective_report.has_pii:
+        st.error(t("pii_file_error"))
+        source_value = t("anonymized_version")
+        anonymized_result = _handle_anonymization(
+            selected_file,
+            payload,
+            effective_report,
+            anonymized_key,
+            parsed_mode,
+            success_text=t("anonymization_done_continue"),
+            button_key="ai_anonymize_continue",
+        )
+        return source_value, anonymized_result
+
+    source_options = [t("original_version"), t("anonymized_version")]
+    source_value = st.radio(t("use_for_ai"), source_options, index=0)
+    if source_value == t("anonymized_version"):
+        anonymized_result = _handle_anonymization(
+            selected_file,
+            payload,
+            pii_report,
+            anonymized_key,
+            parsed_mode,
+            success_text=t("anonymization_done"),
+            button_key="ai_create_anonymized",
+        )
+    return source_value, anonymized_result
+
+
+def _resolve_source_payload(
+    payload: object,
+    use_anonymized: bool,
+    anonymized_result: object | None,
+) -> object:
+    if not use_anonymized or anonymized_result is None:
+        return payload
+    return (
+        anonymized_result.anonymized_df
+        if anonymized_result.anonymized_df is not None
+        else anonymized_result.anonymized_text
+    )
+
+
+def _push_chat_reply(prompt: str, reply: str) -> None:
+    st.session_state["chat_history"].append({"role": "user", "content": prompt.strip()})
+    st.session_state["chat_history"].append({"role": "assistant", "content": reply})
+    st.rerun()
+
+
+def _run_send(
+    *,
+    send_clicked: bool,
+    prompt: str,
+    pii_present: bool,
+    use_anonymized: bool,
+    sender: callable,
+) -> tuple[str | None, str]:
+    reply, reason = dispatch_ai_send(
+        submit_clicked=send_clicked,
+        prompt=prompt,
+        pii_present=pii_present,
+        use_anonymized=use_anonymized,
+        sender=sender,
+    )
+    if reason == "empty_prompt":
+        st.error(t("empty_prompt_error"))
+    elif reason == "pii_requires_anonymization":
+        st.error(t("pii_requires_anonymized_error"))
+    return reply, reason
+
+
 def render_tab_ai(selected_file: str, parsed_mode: PrivacyMode) -> None:
     if not selected_file:
         st.info(t("pick_file_hint"))
@@ -76,32 +168,16 @@ def render_tab_ai(selected_file: str, parsed_mode: PrivacyMode) -> None:
     pii_state = "detected" if effective_report.has_pii else "none"
     st.caption(t("pii_badge", state=pii_state))
 
-    scope_map = {
-        t("ctx_schema_only"): ContextScope.SCHEMA.value,
-        t("ctx_schema_stats"): ContextScope.SCHEMA_STATS.value,
-        t("ctx_schema_stats_sample"): ContextScope.SCHEMA_STATS_SAMPLE.value,
-    }
-    scope_label = st.selectbox(t("ai_context"), options=list(scope_map.keys()), index=1)
-    scope_value = scope_map[scope_label]
-    st.caption(t("ai_context_badge", scope=scope_value))
-
-    if effective_report.has_pii:
-        st.error(t("pii_file_error"))
-        source_value = t("anonymized_version")
-        anonymized_result = _handle_anonymization(
-            selected_file, payload, effective_report, anonymized_key, parsed_mode,
-            success_text=t("anonymization_done_continue"),
-            button_key="ai_anonymize_continue",
-        )
-    else:
-        source_options = [t("original_version"), t("anonymized_version")]
-        source_value = st.radio(t("use_for_ai"), source_options, index=0)
-        if source_value == t("anonymized_version"):
-            anonymized_result = _handle_anonymization(
-                selected_file, payload, pii_report, anonymized_key, parsed_mode,
-                success_text=t("anonymization_done"),
-                button_key="ai_create_anonymized",
-            )
+    scope_value = _select_context_scope()
+    source_value, anonymized_result = _select_ai_source(
+        selected_file,
+        payload,
+        pii_report,
+        effective_report,
+        parsed_mode,
+        anonymized_key,
+        anonymized_result,
+    )
 
     prompt = st.text_area(t("ai_prompt"), height=120, placeholder=t("ai_prompt_placeholder"))
     display_chat_history(_history_newest_first_with_user_first(st.session_state["chat_history"]))
@@ -112,13 +188,7 @@ def render_tab_ai(selected_file: str, parsed_mode: PrivacyMode) -> None:
         st.error(t("create_anonymized_first"))
         return
 
-    source_payload = payload
-    if use_anonymized and anonymized_result is not None:
-        source_payload = (
-            anonymized_result.anonymized_df
-            if anonymized_result.anonymized_df is not None
-            else anonymized_result.anonymized_text
-        )
+    source_payload = _resolve_source_payload(payload, use_anonymized, anonymized_result)
 
     def _sender() -> str:
         context_payload = build_context(
@@ -146,21 +216,15 @@ def render_tab_ai(selected_file: str, parsed_mode: PrivacyMode) -> None:
         return result
 
     try:
-        reply, reason = dispatch_ai_send(
-            submit_clicked=send_clicked,
+        reply, reason = _run_send(
+            send_clicked=send_clicked,
             prompt=prompt,
             pii_present=effective_report.has_pii,
             use_anonymized=use_anonymized,
             sender=_sender,
         )
-        if reason == "empty_prompt":
-            st.error(t("empty_prompt_error"))
-        elif reason == "pii_requires_anonymization":
-            st.error(t("pii_requires_anonymized_error"))
-        elif reason == "ok" and reply is not None:
-            st.session_state["chat_history"].append({"role": "user", "content": prompt.strip()})
-            st.session_state["chat_history"].append({"role": "assistant", "content": reply})
-            st.rerun()
+        if reason == "ok" and reply is not None:
+            _push_chat_reply(prompt, reply)
     except Exception as exc:
         logger.info("ai_send_failed reason=%s", str(exc))
         st.error(t("ai_send_failed", error=exc))
